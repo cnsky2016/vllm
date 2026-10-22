@@ -83,8 +83,9 @@ class AttentionConfig:
     indexer_kv_dtype: IndexerKVDType = "auto"
     """Data type for the sparse-attention indexer K cache. "auto" picks the
     model's default (bf16 for MiniMax M3, fp8 for the DeepSeek sparse
-    indexer). Quantized formats (fp8, mxfp4, nvfp4) require indexer kernel
-    support in the backend."""
+    indexer). DeepSeek V3.2 supports an explicit bf16 indexer on CUDA with
+    bfloat16 model dtype and without context parallelism. Quantized formats
+    (fp8, mxfp4, nvfp4) require indexer kernel support in the backend."""
 
     hisparse_config: HiSparseConfig | None = None
     """HiSparse host-resident KV configuration. Setting this enables experimental

@@ -666,6 +666,10 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
     def forward(self): ...
 
     def get_attn_backend(self) -> type[AttentionBackend]:
+        if self.dtype == torch.bfloat16:
+            from vllm.v1.attention.backends.mla.indexer_bf16 import BF16IndexerBackend
+
+            return BF16IndexerBackend
         return DeepseekV32IndexerBackend
 
 
@@ -686,6 +690,20 @@ class Indexer(nn.Module):
         self.vllm_config = vllm_config
         self.config = config
         self.quant_config = quant_config
+        self.use_bf16_indexer = vllm_config.attention_config.indexer_kv_dtype == "bf16"
+        if self.use_bf16_indexer:
+            if not current_platform.is_cuda():
+                raise ValueError("The BF16 DeepSeek indexer requires CUDA.")
+            if vllm_config.model_config.dtype != torch.bfloat16:
+                raise ValueError("The BF16 DeepSeek indexer requires --dtype bfloat16.")
+            parallel_config = vllm_config.parallel_config
+            if (
+                parallel_config.prefill_context_parallel_size > 1
+                or parallel_config.decode_context_parallel_size > 1
+            ):
+                raise ValueError(
+                    "The BF16 DeepSeek indexer does not support context parallelism."
+                )
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
@@ -717,13 +735,14 @@ class Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
 
-        # NOTE: (zyongye) we use fp8 naive cache,
-        #       where we store value in fp8 and scale in fp32
-        #       per self.quant_block_size element
         assert cache_config is not None
         self.k_cache = DeepseekV32IndexerCache(
-            head_dim=self.head_dim + self.head_dim // self.quant_block_size * 4,
-            dtype=torch.uint8,
+            head_dim=(
+                self.head_dim
+                if self.use_bf16_indexer
+                else self.head_dim + self.head_dim // self.quant_block_size * 4
+            ),
+            dtype=torch.bfloat16 if self.use_bf16_indexer else torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
         )
@@ -732,21 +751,36 @@ class Indexer(nn.Module):
         from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
         self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
-        self.indexer_op = SparseAttnIndexer(
-            self.k_cache,
-            self.quant_block_size,
-            self.scale_fmt,
-            self.topk_tokens,
-            self.head_dim,
-            self.max_model_len,
-            self.max_total_seq_len,
-            self.topk_indices_buffer,
-        )
+        self.indexer_op: nn.Module
+        if self.use_bf16_indexer:
+            from vllm.model_executor.layers.sparse_attn_indexer_bf16 import (
+                BF16SparseAttnIndexer,
+            )
+
+            assert self.topk_indices_buffer is not None
+            self.indexer_op = BF16SparseAttnIndexer(
+                self.k_cache,
+                self.topk_tokens,
+                self.topk_indices_buffer,
+                self.max_model_len,
+            )
+        else:
+            self.indexer_op = SparseAttnIndexer(
+                self.k_cache,
+                self.quant_block_size,
+                self.scale_fmt,
+                self.topk_tokens,
+                self.head_dim,
+                self.max_model_len,
+                self.max_total_seq_len,
+                self.topk_indices_buffer,
+            )
 
         self.is_inplace_rope = is_inplace_rope
         self.n_head_scale = self.n_head**-0.5
         self.use_fused_indexer_q = (
-            current_platform.is_cuda()
+            not self.use_bf16_indexer
+            and current_platform.is_cuda()
             and self.quant_block_size == self.head_dim
             and self.head_dim == 128
             and self.rope_dim == 64
@@ -830,6 +864,10 @@ class Indexer(nn.Module):
             q = torch.cat([q_pe, q_nope], dim=-1)
             # `k_pe` is [num_tokens, rope_dim] (MQA).
             k = torch.cat([k_pe, k_nope], dim=-1)
+
+        if self.use_bf16_indexer:
+            weights = weights.float() * self.softmax_scale * self.n_head_scale
+            return self.indexer_op(hidden_states, q, k, weights)
 
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)

@@ -17,8 +17,10 @@ INDEXER_LAYER = "model.layers.0.self_attn.indexer.k_cache"
 MLA_LAYER = "model.layers.0.self_attn.attn"
 
 
+@pytest.mark.parametrize("bf16_indexer", [False, True])
 def test_sparse_attention_refreshes_batch_state_inside_eager_segment(
     monkeypatch: pytest.MonkeyPatch,
+    bf16_indexer: bool,
 ) -> None:
     metadata = SimpleNamespace(num_actual_tokens=1)
 
@@ -30,8 +32,9 @@ def test_sparse_attention_refreshes_batch_state_inside_eager_segment(
         raise BatchStateRefreshed
 
     layer = SimpleNamespace(
-        indexer=None,
-        skip_topk=True,
+        indexer=object() if bf16_indexer else None,
+        skip_topk=not bf16_indexer,
+        use_bf16_indexer=bf16_indexer,
         layer_name=MLA_LAYER,
         impl=SimpleNamespace(
             prepare_for_batch=refresh_batch_state,
@@ -42,6 +45,13 @@ def test_sparse_attention_refreshes_batch_state_inside_eager_segment(
         deepseek_attention,
         "get_attention_context",
         lambda layer_name: (metadata, None, torch.empty(1), None),
+    )
+    monkeypatch.setattr(
+        deepseek_attention,
+        "sparse_attn_indexer",
+        lambda *args, **kwargs: pytest.fail(
+            "BF16 indices must not be recomputed as FP8"
+        ),
     )
 
     with pytest.raises(BatchStateRefreshed):
@@ -60,6 +70,56 @@ def test_sparse_attention_refreshes_batch_state_inside_eager_segment(
             torch.empty(1, 1, 1),
             torch.empty(1, 1),
         )
+
+
+def test_bf16_model_indexer_preserves_rotated_queries_and_keys(monkeypatch):
+    from vllm.model_executor.models import deepseek_v2
+
+    q = torch.linspace(-0.9, 1.1, 16, dtype=torch.bfloat16).reshape(2, 2, 4)
+    kw = torch.linspace(-1.1, 0.9, 12, dtype=torch.bfloat16).reshape(2, 6)
+    observed: dict[str, torch.Tensor] = {}
+    output = torch.empty(2, 2, dtype=torch.int32)
+
+    def record_indexer(hidden_states, queries, keys, weights):
+        observed.update(q=queries, k=keys, weights=weights)
+        return output
+
+    layer = SimpleNamespace(
+        wq_b=lambda _: (q.clone(), None),
+        wk_weights_proj=lambda _: (kw.clone(), None),
+        k_norm=lambda k: k,
+        n_head=2,
+        head_dim=4,
+        rope_dim=2,
+        is_inplace_rope=False,
+        use_fused_indexer_q=False,
+        use_bf16_indexer=True,
+        softmax_scale=0.5,
+        n_head_scale=2**-0.5,
+        indexer_op=record_indexer,
+    )
+    monkeypatch.setattr(
+        deepseek_v2,
+        "per_token_group_quant_fp8",
+        lambda *args, **kwargs: pytest.fail("BF16 indexer must not quantize Q"),
+    )
+    result = deepseek_v2.Indexer.forward(
+        layer,
+        torch.empty(2, 4, dtype=torch.bfloat16),
+        torch.empty(2, 4, dtype=torch.bfloat16),
+        torch.arange(2),
+        lambda positions, q_pe, k_pe: (-q_pe, -k_pe),
+    )
+    assert result is output
+    expected_q = q.clone()
+    expected_q[..., :2].neg_()
+    expected_k = kw[:, :4].clone()
+    expected_k[:, :2].neg_()
+    torch.testing.assert_close(observed["q"], expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(observed["k"], expected_k, rtol=0, atol=0)
+    torch.testing.assert_close(
+        observed["weights"], kw[:, 4:].float() * 0.5 * 2**-0.5, rtol=0, atol=0
+    )
 
 
 def make_indexer_metadata(
@@ -287,6 +347,7 @@ def test_deepseek_v32_dispatches_selected_mha(
     layer = SimpleNamespace(
         indexer=None,
         skip_topk=False,
+        use_bf16_indexer=False,
         layer_name=MLA_LAYER,
         use_pcp=False,
         _fp8_query=fp8_query,

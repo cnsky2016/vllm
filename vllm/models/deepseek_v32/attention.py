@@ -29,6 +29,7 @@ from vllm.model_executor.layers.sparse_attn_indexer import (
 from vllm.model_executor.models.deepseek_v2 import (
     DeepSeekV2FusedQkvAProjLinear,
     DeepseekV32IndexerCache,
+    Indexer,
     yarn_get_mscale,
 )
 from vllm.model_executor.models.utils import extract_layer_index
@@ -119,7 +120,7 @@ class DeepseekV32Indexer(nn.Module):
 
 
 class DeepseekV32Attention(MLAAttention):
-    indexer: "DeepseekV32Indexer | None"
+    indexer: "DeepseekV32Indexer | Indexer | None"
     indexer_cls: "type[DeepseekV32Indexer]" = DeepseekV32Indexer
     supports_pcp_dcp: ClassVar[bool] = True
 
@@ -186,9 +187,11 @@ class DeepseekV32Attention(MLAAttention):
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
         )
+        use_bf16_indexer = vllm_config.attention_config.indexer_kv_dtype == "bf16"
         indexer = None
         if not skip_topk or is_mtp_layer:
-            indexer = type(self).indexer_cls(
+            indexer_cls = Indexer if use_bf16_indexer else type(self).indexer_cls
+            indexer = indexer_cls(
                 vllm_config,
                 config,
                 hidden_size,
@@ -221,6 +224,7 @@ class DeepseekV32Attention(MLAAttention):
         self.num_local_heads = num_local_heads
         self.qk_head_dim = qk_head_dim
         self.indexer = indexer
+        self.use_bf16_indexer = use_bf16_indexer
         self.topk_indices_buffer = topk_indices_buffer
 
         self.skip_topk = False
@@ -294,7 +298,13 @@ class DeepseekV32Attention(MLAAttention):
             [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
 
-        if self.indexer is not None and not self.skip_topk:
+        has_indexer = (
+            self.indexer is not None
+            and not self.skip_topk
+            and not self.use_bf16_indexer
+        )
+        if has_indexer:
+            assert self.indexer is not None
             kw = self.indexer.wk_weights_proj(hidden_states)[0]
             index_k = kw[:, : self.indexer.head_dim]
             index_weights = kw[:, self.indexer.head_dim :]
@@ -321,8 +331,8 @@ class DeepseekV32Attention(MLAAttention):
         layer_attn_metadata, _, _, _ = get_attention_context(self.layer_name)
         self.impl.prepare_for_batch(layer_attn_metadata)
 
-        if self.indexer is not None and not self.skip_topk:
-            has_indexer = True
+        if has_indexer:
+            assert self.indexer is not None
             indexer_k_norm_w = self.indexer.k_norm.weight
             indexer_k_norm_bias = self.indexer.k_norm.bias
             indexer_k_norm_eps = self.indexer.k_norm.eps
@@ -332,7 +342,6 @@ class DeepseekV32Attention(MLAAttention):
             indexer_softmax_scale = self.indexer.softmax_scale
             indexer_n_head_scale = self.indexer.n_head**-0.5
         else:
-            has_indexer = False
             indexer_k_norm_w = None
             indexer_k_norm_bias = None
             indexer_k_norm_eps = 1e-6
@@ -387,6 +396,9 @@ class DeepseekV32Attention(MLAAttention):
             index_k_out=index_k_out,
         )
 
+        if self.use_bf16_indexer and self.indexer is not None and not self.skip_topk:
+            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+
         if hisparse_cache is not None and mla_slot is not None:
             assert kv_c_out is not None and k_pe_out is not None
             self.update_kv_cache(
@@ -403,7 +415,8 @@ class DeepseekV32Attention(MLAAttention):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
 
-        if self.indexer is not None and not self.skip_topk:
+        if has_indexer:
+            assert self.indexer is not None
             index_q = self.indexer.wq_b(q_c)[0]
             index_q = index_q.view(-1, self.indexer.n_head, self.indexer.head_dim)
         else:
@@ -457,7 +470,11 @@ class DeepseekV32Attention(MLAAttention):
         mqa_q: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        if self.indexer is not None and not self.skip_topk:
+        if (
+            self.indexer is not None
+            and not self.skip_topk
+            and not self.use_bf16_indexer
+        ):
             assert index_q_fp8 is not None
             assert index_weights_out is not None
             if self.use_pcp:
